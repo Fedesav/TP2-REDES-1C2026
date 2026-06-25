@@ -1,9 +1,3 @@
-# protorouter.py — Controlador POX con ARP dinámico y NAT/PAT
-#
-# Uso:
-#   python3 pox/pox.py log.level --DEBUG protorouter
-#
-# Ubicar este archivo en pox/ext/
 
 from pox.core import core
 import pox.openflow.libopenflow_01 as of
@@ -13,10 +7,11 @@ from pox.lib.packet.arp import arp
 from pox.lib.packet.ipv4 import ipv4
 from pox.lib.packet.tcp import tcp
 from pox.lib.packet.udp import udp
+from pox.lib.packet.icmp import icmp, echo
+
 
 log = core.getLogger()
 
-# ── Colores para logs ────────────────────────────────────────────────────────
 RED    = "\033[31m"
 GREEN  = "\033[32m"
 YELLOW = "\033[33m"
@@ -26,7 +21,6 @@ RESET  = "\033[0m"
 def log_color(color, msg):
     log.info(f"{color}{msg}{RESET}")
 
-# ── Configuración de red ─────────────────────────────────────────────────────
 PRIVATE_SUBNET = IPAddr("192.168.1.0")
 PRIVATE_MASK   = 24
 PRIVATE_IP     = IPAddr("192.168.1.254")
@@ -35,7 +29,6 @@ PUBLIC_MAC     = EthAddr("00:00:00:aa:aa:aa")
 PRIVATE_MAC    = EthAddr("00:00:00:bb:bb:bb")
 PUBLIC_PORT    = 1                       # Puerto del switch hacia la red pública
 
-# ── Rango de puertos NAT ─────────────────────────────────────────────────────
 NAT_PORT_MIN = 1024
 NAT_PORT_MAX = 65535
 
@@ -44,14 +37,13 @@ FLOW_HARD_TIMEOUT = 120  # segundos máximos de vida del flujo
 
 
 class NATEntry:
-    """Entrada de la tabla NAT."""
     def __init__(self, proto, priv_ip, priv_port, pub_port, priv_mac, priv_switch_port):
-        self.proto            = proto           # of.ipv4.TCP_PROTOCOL / UDP_PROTOCOL
-        self.priv_ip          = priv_ip         # IPAddr  host privado
-        self.priv_port        = priv_port       # int     puerto original
-        self.pub_port         = pub_port        # int     puerto asignado en la IP pública
-        self.priv_mac         = priv_mac        # EthAddr MAC del host privado
-        self.priv_switch_port = priv_switch_port  # int  puerto del switch hacia el host
+        self.proto            = proto           # TCP / UDP
+        self.priv_ip          = priv_ip         # host privado
+        self.priv_port        = priv_port       # puerto original
+        self.pub_port         = pub_port        # puerto asignado en la IP pública
+        self.priv_mac         = priv_mac        # MAC del host privado
+        self.priv_switch_port = priv_switch_port  # puerto del switch hacia el host
 
 
 class ProtoRouter:
@@ -62,8 +54,7 @@ class ProtoRouter:
         # arp_table[ip] = (EthAddr, switch_port)
         self.arp_table: dict[IPAddr, tuple] = {}
 
-        # Cola de paquetes esperando resolución ARP
-        # pending_arp[ip] = [event, event, ...]
+        # pending_arp[ip] = [Paquetes esperando conocer la MAC destino, ...]
         self.pending_arp: dict[IPAddr, list] = {}
 
         # Tabla NAT: (proto, pub_port) → NATEntry
@@ -75,7 +66,11 @@ class ProtoRouter:
         # Siguiente puerto NAT disponible
         self._next_nat_port = NAT_PORT_MIN
 
-    # ── Entrada principal ────────────────────────────────────────────────────
+        # Manejo de ICMP 
+        self.icmp_nat_out  = {}  # (priv_ip, icmp_id) → pub_id
+        self.icmp_nat_in   = {}  # pub_id → (priv_ip, icmp_id, priv_mac, priv_switch_port)
+        self._next_icmp_id = 1024
+
 
     def _handle_PacketIn(self, event):
         if not event.parsed.parsed:
@@ -90,7 +85,7 @@ class ProtoRouter:
         else:
             log_color(YELLOW, f"Protocolo 0x{ptype:04x} ignorado.")
 
-    # ── Manejo IP ────────────────────────────────────────────────────────────
+    # Manejo IP
 
     def handle_ip(self, event):
         packet = event.parsed
@@ -111,6 +106,11 @@ class ProtoRouter:
         elif src_is_private and not dst_is_private:
             # Trafico saliente
             self._handle_outbound(event, packet, ip_pkt, in_port)
+
+        elif not src_is_private and ip_pkt.dstip == PUBLIC_IP:
+            # Paquete ICMP REPLY ENTRANTE
+            if ip_pkt.protocol == ipv4.ICMP_PROTOCOL:
+                self._handle_icmp_nat_in(event, packet, ip_pkt)
 
         elif not src_is_private and dst_is_private:
             # Trafico entrante (No permitido)
@@ -154,11 +154,15 @@ class ProtoRouter:
         fm.actions.append(of.ofp_action_output(port=out_port))
         self.connection.send(fm)
 
-    # ── Tráfico saliente (privado → público, NAT) ────────────────────────────
 
     def _handle_outbound(self, event, packet, ip_pkt, in_port):
-        # Solo soportamos TCP y UDP
+        # Solo soportamos TCP, ICMP Y UDP
         proto = ip_pkt.protocol
+
+        if proto == ipv4.ICMP_PROTOCOL:
+            self._handle_icmp_nat_out(event, packet, ip_pkt, in_port)
+            return
+
         if proto not in (ipv4.TCP_PROTOCOL, ipv4.UDP_PROTOCOL):
             log_color(RED, f"Protocolo IP {proto} no soportado por NAT — descartado.")
             return
@@ -378,7 +382,6 @@ class ProtoRouter:
         log_color(CYAN, f"ARP REQUEST  ¿Quién tiene {target_ip}? Pregunta {src_ip}")
 
     def _send_arp_forward(self, event, arp_pkt, out_port):
-        """Reenvía un paquete ARP (request o reply) a un puerto específico."""
         eth = ethernet()
         eth.type    = ethernet.ARP_TYPE
         eth.src     = arp_pkt.hwsrc
@@ -404,7 +407,6 @@ class ProtoRouter:
         self.connection.send(msg)
 
     def _enqueue_and_arp(self, event, target_ip):
-        """Guarda el paquete y emite ARP request si es la primera vez."""
         first_request = target_ip not in self.pending_arp
         if first_request:
             self.pending_arp[target_ip] = []
@@ -418,7 +420,6 @@ class ProtoRouter:
             else:
                 self._send_arp_request(target_ip, PUBLIC_MAC, PUBLIC_IP, PUBLIC_PORT)
 
-    # ── Helpers generales ────────────────────────────────────────────────────
 
     def _send_packet_out(self, data, out_port):
         msg = of.ofp_packet_out()
@@ -427,7 +428,6 @@ class ProtoRouter:
         self.connection.send(msg)
 
     def _alloc_nat_port(self):
-        """Asigna el siguiente puerto NAT disponible, con wraparound."""
         start = self._next_nat_port
         while True:
             port = self._next_nat_port
@@ -440,6 +440,68 @@ class ProtoRouter:
             if self._next_nat_port == start:
                 raise RuntimeError("NAT port pool exhausted!")
 
+    def _handle_icmp_nat_out(self, event, packet, ip_pkt, in_port):
+        icmp_pkt = ip_pkt.payload
+        # Solo traducimos Echo Request (type=8)
+        if icmp_pkt.type != 8: # 8 equivale a ECHO REQUEST
+            return
+
+        echo_pkt = icmp_pkt.payload
+        priv_id  = echo_pkt.id
+
+        key_out = (ip_pkt.srcip, priv_id)
+        if key_out in self.icmp_nat_out:
+            pub_id = self.icmp_nat_out[key_out]
+        else:
+            pub_id = self._next_icmp_id
+            self._next_icmp_id += 1
+            self.icmp_nat_out[key_out] = pub_id
+            self.icmp_nat_in[pub_id]   = (ip_pkt.srcip, priv_id, packet.src, in_port)
+
+        if ip_pkt.dstip not in self.arp_table:
+            self._enqueue_and_arp(event, ip_pkt.dstip)
+            return
+
+        dst_mac, _ = self.arp_table[ip_pkt.dstip]
+
+        # Reescribir manualmente y enviar (sin instalar flujo)
+        echo_pkt.id    = pub_id
+        icmp_pkt.payload = echo_pkt
+        icmp_pkt.csum = 0          # POX recalcula al hacer .pack()
+        ip_pkt.srcip   = PUBLIC_IP
+        ip_pkt.payload = icmp_pkt
+        ip_pkt.csum = 0
+        packet.src     = PUBLIC_MAC
+        packet.dst     = dst_mac
+
+        self._send_packet_out(packet.pack(), PUBLIC_PORT)
+        log_color(CYAN, f"ICMP NAT OUT  {key_out[0]} id={priv_id} → {PUBLIC_IP} id={pub_id}")
+
+    def _handle_icmp_nat_in(self, event, packet, ip_pkt):
+        icmp_pkt = ip_pkt.payload
+        if icmp_pkt.type != 0: # 0 equivale a ECHO REPLY
+            return
+
+        echo_pkt = icmp_pkt.payload
+        pub_id   = echo_pkt.id
+
+        if pub_id not in self.icmp_nat_in:
+            log_color(RED, f"ICMP NAT IN: no hay entrada para id={pub_id}")
+            return
+
+        priv_ip, priv_id, priv_mac, priv_port = self.icmp_nat_in[pub_id]
+
+        echo_pkt.id      = priv_id
+        icmp_pkt.payload = echo_pkt
+        icmp_pkt.csum = 0
+        ip_pkt.dstip     = priv_ip
+        ip_pkt.payload   = icmp_pkt
+        ip_pkt.csum  = 0
+        packet.src       = PRIVATE_MAC
+        packet.dst       = priv_mac
+
+        self._send_packet_out(packet.pack(), priv_port)
+        log_color(CYAN, f"ICMP NAT IN   id={pub_id} → {priv_ip} id={priv_id}")    
 
 def launch():
     def start_switch(event):
