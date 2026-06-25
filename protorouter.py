@@ -1,4 +1,3 @@
-
 from pox.core import core
 import pox.openflow.libopenflow_01 as of
 from pox.lib.addresses import EthAddr, IPAddr
@@ -66,9 +65,11 @@ class ProtoRouter:
         # Siguiente puerto NAT disponible
         self._next_nat_port = NAT_PORT_MIN
 
-        # Manejo de ICMP 
-        self.icmp_nat_out  = {}  # (priv_ip, icmp_id) → pub_id
-        self.icmp_nat_in   = {}  # pub_id → (priv_ip, icmp_id, priv_mac, priv_switch_port)
+        # (priv_ip, icmp_id) → pub_id
+        self.icmp_nat_out  = {}  
+
+        # pub_id → (priv_ip, icmp_id, priv_mac, priv_switch_port)
+        self.icmp_nat_in   = {}
         self._next_icmp_id = 1024
 
 
@@ -173,7 +174,7 @@ class ProtoRouter:
         priv_port = l4.srcport
         dst_port  = l4.dstport
 
-        # ¿Ya existe entrada NAT para este flujo?
+       
         nat_key_rev = (proto, ip_pkt.srcip, priv_port)
         if nat_key_rev in self.nat_reverse:
             pub_port = self.nat_reverse[nat_key_rev]
@@ -189,7 +190,7 @@ class ProtoRouter:
 
         entry = self.nat_table[(proto, pub_port)]
 
-        # ¿Tenemos la MAC del servidor público?
+   
         if ip_pkt.dstip not in self.arp_table:
             self._enqueue_and_arp(event, ip_pkt.dstip)
             return
@@ -197,18 +198,18 @@ class ProtoRouter:
         dst_mac, _ = self.arp_table[ip_pkt.dstip]
 
         # Instalar flujos en el switch
-        self._install_nat_outbound_flow(
+        self._install_nat_out_flow(
             ip_pkt.srcip, priv_port, ip_pkt.dstip, dst_port,
             proto, in_port, pub_port, dst_mac)
 
-        self._install_nat_inbound_flow(
+        self._install_nat_in_flow(
             ip_pkt.dstip, dst_port, pub_port,
             proto, PUBLIC_PORT, entry)
 
         # Enviar paquete actual ya traducido
         self._forward_nat_outbound(packet, ip_pkt, l4, pub_port, dst_mac)
 
-    def _install_nat_outbound_flow(self, src_ip, src_port, dst_ip, dst_port,
+    def _install_nat_out_flow(self, src_ip, src_port, dst_ip, dst_port,
                                    proto, in_port, pub_port, dst_mac):
         fm = of.ofp_flow_mod()
         fm.idle_timeout = FLOW_IDLE_TIMEOUT
@@ -232,7 +233,7 @@ class ProtoRouter:
         fm.actions.append(of.ofp_action_output(port=PUBLIC_PORT))
         self.connection.send(fm)
 
-    def _install_nat_inbound_flow(self, pub_dst_ip, pub_dst_port, pub_port,
+    def _install_nat_in_flow(self, pub_dst_ip, pub_dst_port, pub_port,
                                   proto, in_port, entry):
         fm = of.ofp_flow_mod()
         fm.idle_timeout = FLOW_IDLE_TIMEOUT
@@ -253,7 +254,6 @@ class ProtoRouter:
         self.connection.send(fm)
 
     def _forward_nat_outbound(self, packet, ip_pkt, l4, pub_port, dst_mac):
-        """Reescribe y envía el primer paquete NAT saliente."""
         # Reescribir L4
         l4.srcport = pub_port
         # Reescribir IP
@@ -266,7 +266,7 @@ class ProtoRouter:
         log_color(CYAN,
             f"NAT OUT  {PUBLIC_IP}:{pub_port} → {ip_pkt.dstip}  out_port={PUBLIC_PORT}")
 
-    # ── ARP ──────────────────────────────────────────────────────────────────
+    # Manejo ARP
 
     def handle_arp(self, event):
         packet  = event.parsed
